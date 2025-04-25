@@ -1,0 +1,232 @@
+import json
+import base64
+import openai
+import pdfplumber
+from datetime import datetime
+from typing import Dict, Any
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+
+class PatientVisitAgent:
+    def __init__(self):
+        self.client = openai.OpenAI()
+        self.schema = {
+            "demographics": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "dob": {"type": "string", "format": "date"},
+                    "gender": {"type": "string"},
+                    "member_id": {"type": "string"}
+                }
+            },
+            "labs": {
+                "type": "array",
+                "items": {
+                    "test_name": {"type": "string"},
+                    "result": {"type": "string"},
+                    "units": {"type": "string"},
+                    "reference_range": {"type": "string"}
+                }
+            },
+            "medications": {
+                "type": "array",
+                "items": {
+                    "name": {"type": "string"},
+                    "dosage": {"type": "string"},
+                    "frequency": {"type": "string"},
+                    "route": {"type": "string"}
+                }
+            },
+            "allergies": {
+                "type": "array",
+                "items": {
+                    "allergen": {"type": "string"},
+                    "reaction": {"type": "string"},
+                    "severity": {"type": "string"}
+                }
+            }
+        }
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    def llm_generate(self, prompt: str, system: str = None, output_format: str = "text") -> Any:
+        """Generic LLM call with retries"""
+        response = self.client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": system or "You are a helpful medical assistant"},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"} if output_format == "json" else None
+        )
+        return response.choices[0].message.content
+
+    def extract_text_from_pdf(self, state: Dict) -> Dict:
+        """Proper PDF text extraction using pdfplumber"""
+        print("hi extract_text_from_pdf")
+        try:
+            text_content = []
+            with pdfplumber.open(state["pdf_path"]) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        text_content.append(text)
+            state["raw_text"] = "\n".join(text_content)
+
+            if not state["raw_text"].strip():
+                return {"error": "No text could be extracted from PDF - may be scanned document"}
+            print(f"state: {state}")
+            return state
+        except Exception as e:
+            return {"error": f"PDF extraction failed: {str(e)}"}
+
+    def process_pdf(self, pdf_path: str) -> Dict[str, Any]:
+        """End-to-end processing pipeline"""
+        workflow = [
+            self.extract_text_from_pdf,
+            self.analyze_structure,
+            self.extract_demographics,
+            self.extract_labs,
+            self.extract_medications,
+            self.extract_allergies,
+            self.final_validation
+        ]
+
+        state = {"pdf_path": pdf_path}
+        for step in workflow:
+            state = step(state)
+            if "error" in state:
+                raise ValueError(f"Step failed: {state['error']}")
+        return state
+
+    def analyze_structure(self, state: Dict) -> Dict:
+        """Analyze document structure"""
+        prompt = f"""Analyze this medical document:
+        {state['raw_text'][:8000]}  # Truncate to stay within token limits
+
+        Identify these sections if present:
+        - Demographics
+        - Labs
+        - Medications
+        - Allergies
+        - Problems
+        - Health Maintenance
+
+        Return JSON with:
+        - found_sections: List of sections found
+        - document_type: Note type (e.g., progress_note, discharge_summary)"""
+
+        analysis = json.loads(self.llm_generate(prompt, output_format="json"))
+        state["structure"] = analysis
+        print(f"analysis: {analysis}")
+        return state
+
+    def extract_demographics(self, state: Dict) -> Dict:
+        """Extract patient demographics"""
+        print(f"extract_demographics: {state['raw_text']}")
+        prompt = f"""Extract demographics from:
+        {state['raw_text']}
+
+        Return JSON with:
+        - name: Full name
+        - dob: Date of birth (YYYY-MM-DD)
+        - gender: Gender
+        - member_id: Insurance ID if available
+        - primary_care_physician: If mentioned"""
+
+        extracted = json.loads(self.llm_generate(prompt, output_format="json"))
+        state["demographics"] = extracted
+        return state
+
+    def extract_labs(self, state: Dict) -> Dict:
+        """Extract lab results with validation"""
+        prompt = f"""Extract lab results from:
+        {state['raw_text']}
+
+        For each test include:
+        - test_name
+        - result
+        - units
+        - reference_range
+        - date: If available (YYYY-MM-DD)
+
+        Return as JSON array of lab objects"""
+
+        labs = json.loads(self.llm_generate(prompt, output_format="json"))
+        state["labs"] = labs
+        return state
+
+    def extract_medications(self, state: Dict) -> Dict:
+        """Extract current medications"""
+        prompt = f"""Extract medications from:
+        {state['raw_text']}
+
+        For each include:
+        - name
+        - dosage
+        - frequency
+        - route: (PO, IV, etc.)
+        - status: active/discontinued
+
+        Return as JSON array"""
+
+        meds = json.loads(self.llm_generate(prompt, output_format="json"))
+        state["medications"] = meds
+        return state
+
+    def extract_allergies(self, state: Dict) -> Dict:
+        """Extract allergy information"""
+        prompt = f"""Extract allergies from:
+        {state['raw_text']}
+
+        For each include:
+        - allergen
+        - reaction
+        - severity: mild/moderate/severe
+
+        Return as JSON array"""
+
+        allergies = json.loads(self.llm_generate(prompt, output_format="json"))
+        state["allergies"] = allergies
+        return state
+
+    def final_validation(self, state: Dict) -> Dict:
+        """Final validation and cleanup"""
+        prompt = f"""Review this patient data for consistency:
+        {json.dumps(state, indent=2)}
+
+        1. Fix any formatting issues
+        2. Ensure dates are YYYY-MM-DD
+        3. Remove any empty fields
+        4. Validate clinical values are plausible
+
+        Return cleaned JSON"""
+
+        validated = json.loads(self.llm_generate(prompt, output_format="json"))
+        validated["processing_date"] = datetime.now().isoformat()
+        return validated
+
+
+if __name__ == "__main__":
+    # First install required packages:
+    # pip install openai pdfplumber tenacity
+
+    agent = PatientVisitAgent()
+
+    try:
+        # Process an actual PDF file
+        results = agent.process_pdf("patient_visit1.pdf")
+
+        # Save results
+        with open("patient_data.json", "w") as f:
+            json.dump(results, f, indent=2)
+
+        print("Successfully processed patient visit:")
+        print(json.dumps(results, indent=2))
+
+    except Exception as e:
+        print(f"Processing failed: {str(e)}")
+        print("Possible solutions:")
+        print("- Ensure the PDF contains selectable text (not scanned)")
+        print("- Try OCR version for scanned PDFs (see commented code)")
+        print("- Check your OpenAI API key is set")
